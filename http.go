@@ -18,16 +18,7 @@ type HTTPBridge struct {
 
 func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("New HTTP %s request from %s", r.Method, r.RemoteAddr)
-	
-	// Note: The MCP spec requires Origin validation, but we intentionally skip it
-	// because the purpose of tele-mcp is to enable remote access from any origin.
-	
-	// MUST check MCP-Protocol-Version header
-	if r.Header.Get("MCP-Protocol-Version") == "" {
-		http.Error(w, "Missing MCP-Protocol-Version header", http.StatusBadRequest)
-		return
-	}
-	
+
 	// Handle GET requests for SSE streaming
 	if r.Method == http.MethodGet {
 		// MUST check Accept header for SSE
@@ -39,13 +30,13 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		handleSSEStream(w, r)
 		return
 	}
-	
+
 	// Only accept POST requests for sending messages
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	// MUST check Accept header includes both types
 	accept := r.Header.Get("Accept")
 	if !strings.Contains(accept, "application/json") || !strings.Contains(accept, "text/event-stream") {
@@ -60,19 +51,19 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	
+
 	// Parse the incoming message to determine type
 	var incomingMsg map[string]interface{}
 	if err := json.Unmarshal(body, &incomingMsg); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
-	
+
 	// Check if this is a response or notification from client
 	_, hasMethod := incomingMsg["method"]
 	_, hasResult := incomingMsg["result"]
 	_, hasError := incomingMsg["error"]
-	
+
 	if !hasMethod && (hasResult || hasError) {
 		// This is a response or notification response from client
 		// MUST return 202 Accepted
@@ -132,14 +123,14 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		scanner := bufio.NewScanner(process.stdout)
 		for scanner.Scan() {
 			line := scanner.Text()
-			
+
 			// Check if this is a complete JSON response
 			var msg json.RawMessage
 			if err := json.Unmarshal([]byte(line), &msg); err == nil {
 				// Valid JSON, send as SSE event
 				fmt.Fprintf(w, "data: %s\n\n", line)
 				flusher.Flush()
-				
+
 				// Check if this is a result/error response (no id field means it's a response)
 				var check map[string]interface{}
 				if err := json.Unmarshal([]byte(line), &check); err == nil {
@@ -158,7 +149,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		// Non-streaming response - read until we get a complete response
 		scanner := bufio.NewScanner(process.stdout)
 		timeout := time.After(30 * time.Second)
-		
+
 		for {
 			select {
 			case <-timeout:
@@ -167,7 +158,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 			default:
 				if scanner.Scan() {
 					line := scanner.Text()
-					
+
 					// Try to parse as JSON
 					var msg json.RawMessage
 					if err := json.Unmarshal([]byte(line), &msg); err == nil {
@@ -179,7 +170,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 							_, hasResult := check["result"]
 							_, hasError := check["error"]
 							idField, hasID := check["id"]
-							
+
 							if hasMethod && hasID {
 								// This is a request from server - continue reading
 								continue
@@ -237,7 +228,7 @@ func handleSSEStream(w http.ResponseWriter, _ *http.Request) {
 	scanner := bufio.NewScanner(process.stdout)
 	for scanner.Scan() {
 		line := scanner.Text()
-		
+
 		// Validate it's JSON before sending
 		var msg json.RawMessage
 		if err := json.Unmarshal([]byte(line), &msg); err == nil {

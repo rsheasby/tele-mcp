@@ -31,7 +31,7 @@ var (
 
 func main() {
 	parseConfig()
-	
+
 	// Run boot command if specified
 	if bootCommand != "" {
 		log.Printf("Running boot command: %s", bootCommand)
@@ -39,7 +39,7 @@ func main() {
 			log.Printf("Warning: boot command failed: %v", err)
 		}
 	}
-	
+
 	log.Printf("Starting tele-mcp on port %d", port)
 	log.Printf("Transport: %s", transport)
 	if transport == "websocket" || transport == "both" {
@@ -50,21 +50,21 @@ func main() {
 	}
 	log.Printf("MCP command: %s", mcpCommand)
 	log.Printf("Pool size: %d", poolSize)
-	
+
 	var err error
 	pool, err = NewProcessPool(mcpCommand, poolSize)
 	if err != nil {
 		log.Fatalf("Failed to create process pool: %v", err)
 	}
 	defer pool.Shutdown()
-	
+
 	if transport == "websocket" || transport == "both" {
 		http.HandleFunc(wsPath, handleWebSocket)
 	}
 	if transport == "http" || transport == "both" {
 		http.HandleFunc(httpPath, handleHTTP)
 	}
-	
+
 	addr := fmt.Sprintf(":%d", port)
 	log.Printf("Listening on %s", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
@@ -79,9 +79,9 @@ func parseConfig() {
 	flag.StringVar(&wsPath, "ws-path", "/ws", "WebSocket endpoint path")
 	flag.StringVar(&httpPath, "http-path", "/mcp", "HTTP endpoint path")
 	flag.IntVar(&poolSize, "pool", 0, "Process pool size")
-	flag.StringVar(&transport, "transport", "websocket", "Transport mode: websocket, http, or both")
+	flag.StringVar(&transport, "transport", "both", "Transport mode: websocket, http, or both")
 	flag.Parse()
-	
+
 	if envCmd := os.Getenv("MCP_COMMAND"); envCmd != "" {
 		mcpCommand = envCmd
 	}
@@ -107,11 +107,11 @@ func parseConfig() {
 	if envTransport := os.Getenv("TRANSPORT"); envTransport != "" {
 		transport = envTransport
 	}
-	
+
 	if mcpCommand == "" {
 		log.Fatal("MCP_COMMAND environment variable or -command flag must be set")
 	}
-	
+
 	if poolSize > 10 {
 		poolSize = 10
 		log.Printf("Pool size capped at 10")
@@ -125,15 +125,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
-	
+
 	log.Printf("New WebSocket connection from %s", r.RemoteAddr)
-	
+
 	bridge := NewBridge(conn, pool, mcpCommand)
 	if err := bridge.Start(); err != nil {
 		log.Printf("Bridge error: %v", err)
 		return
 	}
-	
+
 	bridge.Wait()
 	log.Printf("WebSocket connection closed from %s", r.RemoteAddr)
 }
@@ -143,10 +143,10 @@ func runBootCommand() error {
 	if len(args) == 0 {
 		return nil
 	}
-	
+
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	
+
 	return cmd.Run()
 }
