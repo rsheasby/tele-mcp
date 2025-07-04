@@ -55,4 +55,6 @@ go build -o tele-mcp
 
 ```bash
 docker build -t tele-mcp .
+
+# Multi-arch builds are handled by GitHub Actions using native ARM64 runners
 ```

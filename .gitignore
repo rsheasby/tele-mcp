@@ -1,5 +1,6 @@
 # Binaries
 tele-mcp
+tele-mcp-*
 *.exe
 *.dll
 *.so
