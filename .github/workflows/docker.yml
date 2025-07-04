@@ -21,14 +21,17 @@ jobs:
         include:
           - runner: ubuntu-24.04
             platform: linux/amd64
+            id: amd64
           - runner: ubuntu-24.04-arm
             platform: linux/arm64
+            id: arm64
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
+      digest-amd64: ${{ matrix.id == 'amd64' && steps.build.outputs.digest || '' }}
+      digest-arm64: ${{ matrix.id == 'arm64' && steps.build.outputs.digest || '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -91,7 +94,14 @@ jobs:
 
       - name: Create manifest list and push
         run: |
-          DIGESTS="${{ join(needs.build.outputs.digest, ' ') }}"
+          DIGEST_AMD64="${{ needs.build.outputs.digest-amd64 }}"
+          DIGEST_ARM64="${{ needs.build.outputs.digest-arm64 }}"
+          
+          # Filter out empty digests
+          DIGESTS=""
+          [ -n "$DIGEST_AMD64" ] && DIGESTS="$DIGESTS ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@$DIGEST_AMD64"
+          [ -n "$DIGEST_ARM64" ] && DIGESTS="$DIGESTS ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@$DIGEST_ARM64"
+          
           for tag in $(echo "${{ steps.meta.outputs.tags }}" | tr '\n' ' '); do
             docker buildx imagetools create -t $tag $DIGESTS
           done
