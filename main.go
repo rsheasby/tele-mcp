@@ -18,7 +18,9 @@ var (
 	bootCommand string
 	port        int
 	wsPath      string
+	httpPath    string
 	poolSize    int
+	transport   string
 	upgrader    = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
@@ -38,7 +40,14 @@ func main() {
 		}
 	}
 	
-	log.Printf("Starting tele-mcp on port %d with path %s", port, wsPath)
+	log.Printf("Starting tele-mcp on port %d", port)
+	log.Printf("Transport: %s", transport)
+	if transport == "websocket" || transport == "both" {
+		log.Printf("WebSocket path: %s", wsPath)
+	}
+	if transport == "http" || transport == "both" {
+		log.Printf("HTTP path: %s", httpPath)
+	}
 	log.Printf("MCP command: %s", mcpCommand)
 	log.Printf("Pool size: %d", poolSize)
 	
@@ -49,7 +58,12 @@ func main() {
 	}
 	defer pool.Shutdown()
 	
-	http.HandleFunc(wsPath, handleWebSocket)
+	if transport == "websocket" || transport == "both" {
+		http.HandleFunc(wsPath, handleWebSocket)
+	}
+	if transport == "http" || transport == "both" {
+		http.HandleFunc(httpPath, handleHTTP)
+	}
 	
 	addr := fmt.Sprintf(":%d", port)
 	log.Printf("Listening on %s", addr)
@@ -61,9 +75,11 @@ func main() {
 func parseConfig() {
 	flag.StringVar(&mcpCommand, "command", "", "MCP command to execute")
 	flag.StringVar(&bootCommand, "boot", "", "Command to run once on startup")
-	flag.IntVar(&port, "port", 8080, "WebSocket server port")
-	flag.StringVar(&wsPath, "path", "/ws", "WebSocket endpoint path")
+	flag.IntVar(&port, "port", 8080, "Server port")
+	flag.StringVar(&wsPath, "ws-path", "/ws", "WebSocket endpoint path")
+	flag.StringVar(&httpPath, "http-path", "/mcp", "HTTP endpoint path")
 	flag.IntVar(&poolSize, "pool", 0, "Process pool size")
+	flag.StringVar(&transport, "transport", "websocket", "Transport mode: websocket, http, or both")
 	flag.Parse()
 	
 	if envCmd := os.Getenv("MCP_COMMAND"); envCmd != "" {
@@ -80,10 +96,16 @@ func parseConfig() {
 	if envPath := os.Getenv("WS_PATH"); envPath != "" {
 		wsPath = envPath
 	}
+	if envPath := os.Getenv("HTTP_PATH"); envPath != "" {
+		httpPath = envPath
+	}
 	if envPool := os.Getenv("POOL_SIZE"); envPool != "" {
 		if p, err := strconv.Atoi(envPool); err == nil {
 			poolSize = p
 		}
+	}
+	if envTransport := os.Getenv("TRANSPORT"); envTransport != "" {
+		transport = envTransport
 	}
 	
 	if mcpCommand == "" {
