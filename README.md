@@ -8,7 +8,7 @@ A WebSocket bridge for MCP (Model Context Protocol) servers that use stdio trans
 - Process pooling for faster connection response times
 - One fresh process per WebSocket connection (never reused)
 - Automatic process lifecycle management
-- Built on Ubuntu 24.04 with Node.js, Python, Rust/Cargo, and UPX pre-installed
+- Built on Ubuntu 24.04 with Node.js/npm, Python/pip/uv, and Rust/Cargo pre-installed
 
 ## Usage
 
