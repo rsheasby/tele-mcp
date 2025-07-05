@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     python3-venv \
     ca-certificates \
+    golang \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust
