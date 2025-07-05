@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -230,6 +231,13 @@ func introspectChildServer(mcpCommand string) (*client.Client, mcp.Implementatio
 	if err != nil {
 		return nil, mcp.Implementation{}, mcp.ServerCapabilities{}, err
 	}
+	
+	// Pipe stderr to system stderr
+	if stderr, ok := client.GetStderr(stdioClient); ok {
+		go func() {
+			io.Copy(os.Stderr, stderr)
+		}()
+	}
 
 	// Initialize the client
 	initReq := mcp.InitializeRequest{
@@ -280,6 +288,13 @@ func (b *BridgeServer) createSessionForClient(ctx context.Context, sessionID str
 	if err != nil {
 		log.Printf("Failed to create stdio client for session %s: %v", sessionID, err)
 		return
+	}
+	
+	// Pipe stderr to system stderr
+	if stderr, ok := client.GetStderr(stdioClient); ok {
+		go func() {
+			io.Copy(os.Stderr, stderr)
+		}()
 	}
 
 	// Initialize the client
