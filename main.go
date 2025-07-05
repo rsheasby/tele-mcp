@@ -1,152 +1,236 @@
 package main
 
 import (
-	"flag"
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
-	"strconv"
-	"strings"
+	"sync"
 
-	"github.com/gorilla/websocket"
+	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
 
-var (
-	mcpCommand  string
+type Session struct {
+	id         string
+	stdioClient client.Client
+	mutex      sync.RWMutex
+}
+
+type Bridge struct {
 	bootCommand string
-	port        int
-	wsPath      string
-	httpPath    string
-	poolSize    int
-	transport   string
-	upgrader    = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
-	}
-	pool *ProcessPool
-)
+	mcpCommand  string
+	sessions    sync.Map
+	bootClient  client.Client
+}
 
 func main() {
-	parseConfig()
+	bootCommand := os.Getenv("BOOT_COMMAND")
+	mcpCommand := os.Getenv("MCP_COMMAND")
+
+	if mcpCommand == "" {
+		log.Fatal("MCP_COMMAND environment variable is required")
+	}
+
+	bridge := &Bridge{
+		bootCommand: bootCommand,
+		mcpCommand:  mcpCommand,
+	}
 
 	// Run boot command if specified
 	if bootCommand != "" {
 		log.Printf("Running boot command: %s", bootCommand)
-		if err := runBootCommand(); err != nil {
-			log.Printf("Warning: boot command failed: %v", err)
+		cmd := exec.Command("sh", "-c", bootCommand)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			log.Printf("Boot command failed: %v", err)
 		}
 	}
 
-	log.Printf("Starting tele-mcp on port %d", port)
-	log.Printf("Transport: %s", transport)
-	if transport == "websocket" || transport == "both" {
-		log.Printf("WebSocket path: %s", wsPath)
-	}
-	if transport == "http" || transport == "both" {
-		log.Printf("HTTP path: %s", httpPath)
-	}
-	log.Printf("MCP command: %s", mcpCommand)
-	log.Printf("Pool size: %d", poolSize)
-
-	var err error
-	pool, err = NewProcessPool(mcpCommand, poolSize)
+	// Create a boot client to get server info
+	bootClient, err := bridge.createStdioClient()
 	if err != nil {
-		log.Fatalf("Failed to create process pool: %v", err)
+		log.Fatalf("Failed to create boot client: %v", err)
 	}
-	defer pool.Shutdown()
+	bridge.bootClient = bootClient
 
-	if transport == "websocket" || transport == "both" {
-		http.HandleFunc(wsPath, handleWebSocket)
-	}
-	if transport == "http" || transport == "both" {
-		http.HandleFunc(httpPath, handleHTTP)
-	}
-
-	addr := fmt.Sprintf(":%d", port)
-	log.Printf("Listening on %s", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Fatalf("Server failed: %v", err)
+	// Create HTTP server
+	httpServer := server.NewStreamableHTTPServer(bridge)
+	
+	log.Println("Starting HTTP MCP bridge on :8080")
+	if err := httpServer.Start(":8080"); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
 	}
 }
 
-func parseConfig() {
-	flag.StringVar(&mcpCommand, "command", "", "MCP command to execute")
-	flag.StringVar(&bootCommand, "boot", "", "Command to run once on startup")
-	flag.IntVar(&port, "port", 8080, "Server port")
-	flag.StringVar(&wsPath, "ws-path", "/ws", "WebSocket endpoint path")
-	flag.StringVar(&httpPath, "http-path", "/mcp", "HTTP endpoint path")
-	flag.IntVar(&poolSize, "pool", 0, "Process pool size")
-	flag.StringVar(&transport, "transport", "both", "Transport mode: websocket, http, or both")
-	flag.Parse()
-
-	if envCmd := os.Getenv("MCP_COMMAND"); envCmd != "" {
-		mcpCommand = envCmd
-	}
-	if envBoot := os.Getenv("BOOT_COMMAND"); envBoot != "" {
-		bootCommand = envBoot
-	}
-	if envPort := os.Getenv("PORT"); envPort != "" {
-		if p, err := strconv.Atoi(envPort); err == nil {
-			port = p
-		}
-	}
-	if envPath := os.Getenv("WS_PATH"); envPath != "" {
-		wsPath = envPath
-	}
-	if envPath := os.Getenv("HTTP_PATH"); envPath != "" {
-		httpPath = envPath
-	}
-	if envPool := os.Getenv("POOL_SIZE"); envPool != "" {
-		if p, err := strconv.Atoi(envPool); err == nil {
-			poolSize = p
-		}
-	}
-	if envTransport := os.Getenv("TRANSPORT"); envTransport != "" {
-		transport = envTransport
-	}
-
-	if mcpCommand == "" {
-		log.Fatal("MCP_COMMAND environment variable or -command flag must be set")
-	}
-
-	if poolSize > 10 {
-		poolSize = 10
-		log.Printf("Pool size capped at 10")
-	}
-}
-
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+func (b *Bridge) createStdioClient() (client.Client, error) {
+	// Parse command as shell command
+	cmd := exec.Command("sh", "-c", b.mcpCommand)
+	
+	c, err := client.NewStdioClient(cmd)
 	if err != nil {
-		log.Printf("WebSocket upgrade failed: %v", err)
-		return
-	}
-	defer conn.Close()
-
-	log.Printf("New WebSocket connection from %s", r.RemoteAddr)
-
-	bridge := NewBridge(conn, pool, mcpCommand)
-	if err := bridge.Start(); err != nil {
-		log.Printf("Bridge error: %v", err)
-		return
+		return nil, fmt.Errorf("failed to create stdio client: %w", err)
 	}
 
-	bridge.Wait()
-	log.Printf("WebSocket connection closed from %s", r.RemoteAddr)
+	ctx := context.Background()
+	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeRequestParams{
+			ProtocolVersion: "2024-11-05",
+			Capabilities: mcp.ClientCapabilities{
+				Tools:     &mcp.ToolsCapability{},
+				Resources: &mcp.ResourcesCapability{},
+				Prompts:   &mcp.PromptsCapability{},
+			},
+			ClientInfo: mcp.Implementation{
+				Name:    "tele-mcp-bridge",
+				Version: "1.0.0",
+			},
+		},
+	})
+	if err != nil {
+		c.Close()
+		return nil, fmt.Errorf("failed to initialize client: %w", err)
+	}
+
+	return c, nil
 }
 
-func runBootCommand() error {
-	args := strings.Fields(bootCommand)
-	if len(args) == 0 {
-		return nil
+// ServerInfo returns the server information from the boot client
+func (b *Bridge) ServerInfo() mcp.ServerInfo {
+	if b.bootClient == nil {
+		return mcp.ServerInfo{
+			Name:    "tele-mcp-bridge",
+			Version: "1.0.0",
+		}
+	}
+	
+	// Get server info from boot client
+	// This is a placeholder - we need to store this from initialization
+	return mcp.ServerInfo{
+		Name:    "tele-mcp-bridge",
+		Version: "1.0.0",
+	}
+}
+
+// Initialize handles client initialization and creates a new session
+func (b *Bridge) Initialize(ctx context.Context, req mcp.InitializeRequest) (*mcp.InitializeResult, error) {
+	// Create new stdio client for this session
+	stdioClient, err := b.createStdioClient()
+	if err != nil {
+		return nil, err
 	}
 
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// Get session ID from context (set by HTTP transport)
+	sessionID := ctx.Value("sessionID").(string)
 
-	return cmd.Run()
+	session := &Session{
+		id:          sessionID,
+		stdioClient: stdioClient,
+	}
+
+	b.sessions.Store(sessionID, session)
+
+	// Forward the initialization to get actual server info
+	result, err := stdioClient.Initialize(ctx, req)
+	if err != nil {
+		stdioClient.Close()
+		b.sessions.Delete(sessionID)
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// CallTool forwards tool calls to the appropriate stdio client
+func (b *Bridge) CallTool(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	session, err := b.getSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return session.stdioClient.CallTool(ctx, req)
+}
+
+// ListTools forwards list tools requests
+func (b *Bridge) ListTools(ctx context.Context) (*mcp.ListToolsResult, error) {
+	session, err := b.getSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return session.stdioClient.ListTools(ctx, mcp.ListToolsRequest{})
+}
+
+// ListResources forwards list resources requests
+func (b *Bridge) ListResources(ctx context.Context) (*mcp.ListResourcesResult, error) {
+	session, err := b.getSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return session.stdioClient.ListResources(ctx, mcp.ListResourcesRequest{})
+}
+
+// ReadResource forwards read resource requests
+func (b *Bridge) ReadResource(ctx context.Context, req mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	session, err := b.getSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return session.stdioClient.ReadResource(ctx, req)
+}
+
+// ListPrompts forwards list prompts requests
+func (b *Bridge) ListPrompts(ctx context.Context) (*mcp.ListPromptsResult, error) {
+	session, err := b.getSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return session.stdioClient.ListPrompts(ctx, mcp.ListPromptsRequest{})
+}
+
+// GetPrompt forwards get prompt requests
+func (b *Bridge) GetPrompt(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+	session, err := b.getSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return session.stdioClient.GetPrompt(ctx, req)
+}
+
+// Cleanup handles session cleanup
+func (b *Bridge) Cleanup(ctx context.Context) error {
+	sessionID := ctx.Value("sessionID").(string)
+	
+	if val, ok := b.sessions.Load(sessionID); ok {
+		session := val.(*Session)
+		session.stdioClient.Close()
+		b.sessions.Delete(sessionID)
+	}
+
+	return nil
+}
+
+func (b *Bridge) getSession(ctx context.Context) (*Session, error) {
+	sessionID := ctx.Value("sessionID").(string)
+	
+	val, ok := b.sessions.Load(sessionID)
+	if !ok {
+		return nil, fmt.Errorf("session not found: %s", sessionID)
+	}
+
+	return val.(*Session), nil
+}
+
+// ServeHTTP implements http.Handler
+func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// The StreamableHTTPServer will handle the actual HTTP protocol
+	// This is just here to satisfy the interface if needed
 }
