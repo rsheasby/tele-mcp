@@ -66,10 +66,7 @@ func main() {
 
 	// Create a template client to introspect the child server
 	log.Println("Introspecting child MCP server...")
-	templateClient, serverInfo, capabilities, err := introspectChildServer(mcpCommand)
-	if err != nil {
-		log.Fatalf("Failed to introspect child server: %v", err)
-	}
+	templateClient, serverInfo, capabilities := introspectChildServerWithRetry(mcpCommand)
 	defer templateClient.Close()
 
 	// Build server options based on discovered capabilities
@@ -200,6 +197,19 @@ func main() {
 	}
 }
 
+func introspectChildServerWithRetry(mcpCommand string) (*client.Client, mcp.Implementation, mcp.ServerCapabilities) {
+	for {
+		client, impl, caps, err := introspectChildServer(mcpCommand)
+		if err == nil {
+			return client, impl, caps
+		}
+		
+		log.Printf("Failed to introspect child server: %v", err)
+		log.Println("Retrying in 1 minute...")
+		time.Sleep(1 * time.Minute)
+	}
+}
+
 func introspectChildServer(mcpCommand string) (*client.Client, mcp.Implementation, mcp.ServerCapabilities, error) {
 	// Parse command
 	parts := strings.Fields(mcpCommand)
@@ -236,10 +246,14 @@ func introspectChildServer(mcpCommand string) (*client.Client, mcp.Implementatio
 		},
 	}
 
-	result, err := stdioClient.Initialize(context.Background(), initReq)
+	// Use a timeout context to prevent deadlocks
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	result, err := stdioClient.Initialize(ctx, initReq)
 	if err != nil {
 		stdioClient.Close()
-		return nil, mcp.Implementation{}, mcp.ServerCapabilities{}, err
+		return nil, mcp.Implementation{}, mcp.ServerCapabilities{}, fmt.Errorf("failed to initialize client: %w", err)
 	}
 
 	return stdioClient, result.ServerInfo, result.Capabilities, nil
@@ -283,7 +297,11 @@ func (b *BridgeServer) createSessionForClient(ctx context.Context, sessionID str
 		},
 	}
 
-	_, err = stdioClient.Initialize(ctx, initReq)
+	// Use a timeout to prevent deadlocks
+	initCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	
+	_, err = stdioClient.Initialize(initCtx, initReq)
 	if err != nil {
 		stdioClient.Close()
 		log.Printf("Failed to initialize client for session %s: %v", sessionID, err)
