@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -15,9 +17,11 @@ import (
 )
 
 type Session struct {
-	id          string
-	stdioClient *client.Client
-	mutex       sync.RWMutex
+	id           string
+	stdioClient  *client.Client
+	mutex        sync.RWMutex
+	restartCount int
+	lastError    time.Time
 }
 
 type BridgeServer struct {
@@ -25,6 +29,7 @@ type BridgeServer struct {
 	bootCommand string
 	mcpCommand  string
 	sessions    sync.Map
+	durableMode bool
 	
 	// Template client to get server info
 	templateClient *client.Client
@@ -32,9 +37,16 @@ type BridgeServer struct {
 	capabilities   mcp.ServerCapabilities
 }
 
+// Custom errors for LLM-friendly messages
+var (
+	ErrTemporaryFailure = errors.New("Temporary connection issue. Please retry immediately with the same parameters.")
+	ErrSessionRestarted = errors.New("MCP session restarted. Some context may be lost. Please retry with the same parameters.")
+)
+
 func main() {
 	bootCommand := os.Getenv("BOOT_COMMAND")
 	mcpCommand := os.Getenv("MCP_COMMAND")
+	durableMode := os.Getenv("DURABLE_MODE") != "false" // Default to true
 
 	if mcpCommand == "" {
 		log.Fatal("MCP_COMMAND environment variable is required")
@@ -47,8 +59,9 @@ func main() {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
-			log.Printf("Boot command failed: %v", err)
+			log.Fatalf("Boot command failed: %v", err)
 		}
+		log.Println("Boot command completed successfully")
 	}
 
 	// Create a template client to introspect the child server
@@ -59,28 +72,31 @@ func main() {
 	}
 	defer templateClient.Close()
 
-	// Create MCP server that mirrors the child server
-	mcpServer := server.NewMCPServer(serverInfo.Name, serverInfo.Version)
+	// Build server options based on discovered capabilities
+	var opts []server.ServerOption
 	
-	// Set capabilities based on child server
 	if capabilities.Tools != nil {
-		mcpServer = server.NewMCPServer(serverInfo.Name, serverInfo.Version,
-			server.WithToolCapabilities(true))
+		opts = append(opts, server.WithToolCapabilities(true))
 	}
 	if capabilities.Resources != nil {
-		mcpServer = server.NewMCPServer(serverInfo.Name, serverInfo.Version,
-			server.WithResourceCapabilities(capabilities.Resources.Subscribe, capabilities.Resources.ListChanged))
+		opts = append(opts, server.WithResourceCapabilities(
+			capabilities.Resources.Subscribe,
+			capabilities.Resources.ListChanged))
 	}
 	if capabilities.Prompts != nil {
-		mcpServer = server.NewMCPServer(serverInfo.Name, serverInfo.Version,
-			server.WithPromptCapabilities(capabilities.Prompts.ListChanged))
+		opts = append(opts, server.WithPromptCapabilities(
+			capabilities.Prompts.ListChanged))
 	}
+
+	// Create MCP server that mirrors the child server
+	mcpServer := server.NewMCPServer(serverInfo.Name, serverInfo.Version, opts...)
 
 	// Create bridge server
 	bridge := &BridgeServer{
 		MCPServer:      mcpServer,
 		bootCommand:    bootCommand,
 		mcpCommand:     mcpCommand,
+		durableMode:    durableMode,
 		templateClient: templateClient,
 		serverInfo:     serverInfo,
 		capabilities:   capabilities,
@@ -97,24 +113,9 @@ func main() {
 		log.Printf("Client %s disconnected", session.SessionID())
 		bridge.cleanupSession(session.SessionID())
 	})
-
-	// Re-create server with all capabilities and hooks
-	var opts []server.ServerOption
+	
+	// Re-create server with hooks added
 	opts = append(opts, server.WithHooks(hooks))
-	
-	if capabilities.Tools != nil {
-		opts = append(opts, server.WithToolCapabilities(true))
-	}
-	if capabilities.Resources != nil {
-		opts = append(opts, server.WithResourceCapabilities(
-			capabilities.Resources.Subscribe,
-			capabilities.Resources.ListChanged))
-	}
-	if capabilities.Prompts != nil {
-		opts = append(opts, server.WithPromptCapabilities(
-			capabilities.Prompts.ListChanged))
-	}
-	
 	bridge.MCPServer = server.NewMCPServer(serverInfo.Name, serverInfo.Version, opts...)
 
 	// Get initial tools/resources/prompts from template and register them
@@ -125,13 +126,16 @@ func main() {
 		tools, err := templateClient.ListTools(ctx, mcp.ListToolsRequest{})
 		if err == nil {
 			for _, tool := range tools.Tools {
-				// Register each tool with a handler that forwards to child
-				toolCopy := tool // Capture tool in closure
+				// The tool.InputSchema contains the full JSON schema for parameters
+				// We need to pass this through to the new tool
+				newTool := mcp.Tool{
+					Name:        tool.Name,
+					Description: tool.Description,
+					InputSchema: tool.InputSchema, // This preserves all parameter definitions
+				}
+				
 				bridge.AddTool(
-					mcp.NewTool(toolCopy.Name, 
-						mcp.WithDescription(toolCopy.Description),
-						// Note: We can't perfectly replicate input schemas without more introspection
-					),
+					newTool,
 					func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 						return bridge.handleToolCall(ctx, req)
 					},
@@ -145,18 +149,17 @@ func main() {
 		resources, err := templateClient.ListResources(ctx, mcp.ListResourcesRequest{})
 		if err == nil {
 			for _, resource := range resources.Resources {
-				// Register each resource with a handler that forwards to child
-				resourceCopy := resource // Capture resource in closure
-				var opts []mcp.ResourceOption
-				if resourceCopy.Description != "" {
-					opts = append(opts, mcp.WithResourceDescription(resourceCopy.Description))
-				}
-				if resourceCopy.MIMEType != "" {
-					opts = append(opts, mcp.WithMIMEType(resourceCopy.MIMEType))
+				// Create a complete copy of the resource to preserve all fields
+				newResource := mcp.Resource{
+					Annotated:   resource.Annotated,
+					URI:         resource.URI,
+					Name:        resource.Name,
+					Description: resource.Description,
+					MIMEType:    resource.MIMEType,
 				}
 				
 				bridge.AddResource(
-					mcp.NewResource(resourceCopy.URI, resourceCopy.Name, opts...),
+					newResource,
 					func(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 						return bridge.handleResourceRead(ctx, req)
 					},
@@ -170,15 +173,15 @@ func main() {
 		prompts, err := templateClient.ListPrompts(ctx, mcp.ListPromptsRequest{})
 		if err == nil {
 			for _, prompt := range prompts.Prompts {
-				// Register each prompt with a handler that forwards to child
-				promptCopy := prompt // Capture prompt in closure
-				var opts []mcp.PromptOption
-				if promptCopy.Description != "" {
-					opts = append(opts, mcp.WithPromptDescription(promptCopy.Description))
+				// Create a new prompt that replicates the original including arguments
+				newPrompt := mcp.Prompt{
+					Name:        prompt.Name,
+					Description: prompt.Description,
+					Arguments:   prompt.Arguments, // This preserves all argument definitions
 				}
 				
 				bridge.AddPrompt(
-					mcp.NewPrompt(promptCopy.Name, opts...),
+					newPrompt,
 					func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
 						return bridge.handlePromptGet(ctx, req)
 					},
@@ -190,7 +193,8 @@ func main() {
 	// Start HTTP server
 	httpServer := server.NewStreamableHTTPServer(bridge.MCPServer)
 
-	log.Printf("Starting HTTP MCP bridge on :8080 for '%s' v%s", serverInfo.Name, serverInfo.Version)
+	log.Printf("Starting HTTP MCP bridge on :8080 for '%s' v%s (durable mode: %v)", 
+		serverInfo.Name, serverInfo.Version, durableMode)
 	if err := httpServer.Start(":8080"); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
@@ -304,6 +308,28 @@ func (b *BridgeServer) cleanupSession(sessionID string) {
 	}
 }
 
+func (b *BridgeServer) restartSession(ctx context.Context, sessionID string) error {
+	// Clean up existing session
+	b.cleanupSession(sessionID)
+	
+	// Create new session
+	b.createSessionForClient(ctx, sessionID)
+	
+	// Check if session was created successfully
+	if _, ok := b.sessions.Load(sessionID); !ok {
+		return fmt.Errorf("failed to restart session")
+	}
+	
+	// Update restart count
+	if val, ok := b.sessions.Load(sessionID); ok {
+		session := val.(*Session)
+		session.restartCount++
+		session.lastError = time.Now()
+	}
+	
+	return nil
+}
+
 func (b *BridgeServer) getSessionFromContext(ctx context.Context) (*Session, error) {
 	// Get session from server context
 	clientSession := server.ClientSessionFromContext(ctx)
@@ -313,44 +339,119 @@ func (b *BridgeServer) getSessionFromContext(ctx context.Context) (*Session, err
 
 	val, ok := b.sessions.Load(clientSession.SessionID())
 	if !ok {
-		return nil, fmt.Errorf("session not found: %s", clientSession.SessionID())
+		// In durable mode, try to create the session if it doesn't exist
+		if b.durableMode {
+			b.createSessionForClient(ctx, clientSession.SessionID())
+			// Try again
+			val, ok = b.sessions.Load(clientSession.SessionID())
+			if !ok {
+				return nil, ErrTemporaryFailure
+			}
+		} else {
+			return nil, fmt.Errorf("session not found: %s", clientSession.SessionID())
+		}
 	}
 
 	return val.(*Session), nil
 }
 
-func (b *BridgeServer) handleToolCall(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	session, err := b.getSessionFromContext(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get session: %w", err)
+func isRetriableError(err error) bool {
+	if err == nil {
+		return false
 	}
-
-	// Forward the tool call to the child server
-	return session.stdioClient.CallTool(ctx, req)
+	
+	// Check for common patterns that indicate a dead process
+	errStr := err.Error()
+	return strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "EOF") ||
+		strings.Contains(errStr, "process exited") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "i/o timeout")
 }
 
-func (b *BridgeServer) handleResourceRead(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+func (b *BridgeServer) handleWithRetry(
+	ctx context.Context,
+	operation func(*Session) error,
+) error {
 	session, err := b.getSessionFromContext(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get session: %w", err)
+		return err
 	}
 
-	// Forward the resource read to the child server
-	result, err := session.stdioClient.ReadResource(ctx, req)
+	// Try the operation
+	err = operation(session)
+	
+	// If no error or not in durable mode, return as-is
+	if err == nil || !b.durableMode {
+		return err
+	}
+	
+	// Check if this is a retriable error
+	if !isRetriableError(err) {
+		return err
+	}
+	
+	// Limit restart attempts
+	if session.restartCount >= 3 && time.Since(session.lastError) < 5*time.Minute {
+		log.Printf("Session %s exceeded restart limit", session.id)
+		return err
+	}
+	
+	// Try to restart the session
+	log.Printf("Attempting to restart session %s due to error: %v", session.id, err)
+	
+	clientSession := server.ClientSessionFromContext(ctx)
+	if clientSession == nil {
+		return err
+	}
+	
+	if restartErr := b.restartSession(ctx, clientSession.SessionID()); restartErr != nil {
+		log.Printf("Failed to restart session %s: %v", clientSession.SessionID(), restartErr)
+		return ErrTemporaryFailure
+	}
+	
+	// Session was restarted
+	return ErrSessionRestarted
+}
+
+func (b *BridgeServer) handleToolCall(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	var result *mcp.CallToolResult
+	err := b.handleWithRetry(ctx, func(session *Session) error {
+		var callErr error
+		result, callErr = session.stdioClient.CallTool(ctx, req)
+		return callErr
+	})
+	
 	if err != nil {
 		return nil, err
 	}
+	return result, nil
+}
 
-	// ResourceContents is already the correct type from ReadResourceResult
+func (b *BridgeServer) handleResourceRead(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+	var result *mcp.ReadResourceResult
+	err := b.handleWithRetry(ctx, func(session *Session) error {
+		var readErr error
+		result, readErr = session.stdioClient.ReadResource(ctx, req)
+		return readErr
+	})
+	
+	if err != nil {
+		return nil, err
+	}
 	return result.Contents, nil
 }
 
 func (b *BridgeServer) handlePromptGet(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
-	session, err := b.getSessionFromContext(ctx)
+	var result *mcp.GetPromptResult
+	err := b.handleWithRetry(ctx, func(session *Session) error {
+		var getErr error
+		result, getErr = session.stdioClient.GetPrompt(ctx, req)
+		return getErr
+	})
+	
 	if err != nil {
-		return nil, fmt.Errorf("failed to get session: %w", err)
+		return nil, err
 	}
-
-	// Forward the prompt get to the child server
-	return session.stdioClient.GetPrompt(ctx, req)
+	return result, nil
 }
